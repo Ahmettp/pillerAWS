@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Şarj Oturumları Analizi – ZA Eksenli</title>
+    <style>
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+            margin: 20px;
+            line-height: 1.6;
+            background: #fafafa;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 1rem;
+        }
+        #sessions {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+            margin-bottom: 2rem;
+        }
+        .session-btn {
+            padding: 0.6rem 1rem;
+            border: 1px solid #0077ff;
+            border-radius: 8px;
+            background: #fff;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+        .session-btn:hover {
+            background: #e6f0ff;
+        }
+        #charts {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 2rem;
+            margin-top: 1.5rem;
+        }
+        canvas {
+            background: #fff;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            padding: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>Deneme.txt Şarj Oturumları</h1>
+
+    <div id="sessions">Şarj oturumları yükleniyor...</div>
+
+    <div id="charts"></div>
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+    <script>
+    /* ==================== Yardımcı Fonksiyonlar ==================== */
+    const parseLine = (line) => {
+        try {
+            return JSON.parse(line);
+        } catch {
+            return null;
+        }
+    };
+    const addSeconds = (date, s) => new Date(date.getTime() + s * 1000);
+
+    /* ==================== 1) Dosyayı çek ve işle ==================== */
+    (async () => {
+        const url =
+            "https://pillerbucket.s3.eu-north-1.amazonaws.com/html/115-8-35-17-73/deneme.txt";
+        const res = await fetch(url);
+        const container = document.getElementById("sessions");
+        if (!res.ok) {
+            container.textContent = "Dosya alınamadı!";
+            return;
+        }
+
+        const content = await res.text();
+        const lines = content.split(/\r?\n/);
+        const outLines = [];
+        let baslatFlag = 0;
+
+        /* ------------------ Otomatik düzenlemeler ------------------ */
+        let firstTimestamp = null,
+            nextId = null,
+            firstMessage = null;
+        for (let i = 0; i < lines.length; i++) {
+            const j = parseLine(lines[i]);
+            if (!j) continue;
+            if (j.timestamp && firstTimestamp === null) {
+                firstTimestamp = j.timestamp;
+                firstMessage = j.message?.Durum;
+            }
+            if (i + 1 < lines.length) {
+                const jN = parseLine(lines[i + 1]);
+                if (jN?.message?.ID) nextId = jN.message.ID;
+            }
+            if (firstTimestamp && nextId) break;
+        }
+        if (firstMessage !== "Sarj Baslatildi" && firstTimestamp) {
+            baslatFlag = 1;
+            const ts = addSeconds(new Date(firstTimestamp), -3);
+            outLines.push(
+                JSON.stringify({
+                    timestamp: ts.toISOString(),
+                    message: { Durum: "Sarj Baslatildi", ID: nextId ?? "Yok", IstNO: 1 },
+                })
+            );
+        }
+
+        for (let i = 0; i < lines.length; i++) {
+            const j = parseLine(lines[i]);
+            if (!j) continue;
+            if (j.message?.Durum === "Sarj Baslatildi") {
+                if (baslatFlag) {
+                    const prev = parseLine(lines[i - 1]);
+                    if (prev) {
+                        outLines.push(
+                            JSON.stringify({
+                                timestamp: prev.timestamp,
+                                message: {
+                                    Durum: "Sarj Sonlandirildi",
+                                    Sebep: "Durdurma verisi alinmadan durduruldu",
+                                    ID: prev.message.ID,
+                                },
+                            })
+                        );
+                    }
+                }
+                baslatFlag = 1;
+            }
+            if (baslatFlag === 0 && j.message?.V) {
+                outLines.push(
+                    JSON.stringify({
+                        timestamp: addSeconds(new Date(j.timestamp), -3).toISOString(),
+                        message: { Durum: "Sarj Baslatildi", IstNO: 1, ID: j.message.ID },
+                    })
+                );
+                baslatFlag = 1;
+            }
+            outLines.push(lines[i]);
+            if (j.message?.Durum === "Sarj Sonlandirildi") {
+                baslatFlag = 0;
+            }
+        }
+
+        /* ------------------ 2) Şarj oturumlarını grupla ------------------ */
+        const sessions = []; // {start:Date,end:Date|null,data:[{t:Date,V,A,W}]}
+        let current = null;
+        for (const l of outLines) {
+            const j = parseLine(l);
+            if (!j) continue;
+            const d = new Date(j.timestamp);
+            if (j.message?.Durum === "Sarj Baslatildi") {
+                current = { start: d, end: null, data: [] };
+                sessions.push(current);
+            } else if (j.message?.Durum === "Sarj Sonlandirildi") {
+                if (current) current.end = d;
+                current = null;
+            } else if (
+                j.message?.V !== undefined ||
+                j.message?.A !== undefined ||
+                j.message?.W !== undefined
+            ) {
+                if (current) {
+                    current.data.push({
+                        t: d,
+                        V: j.message.V ?? null,
+                        A: j.message.A ?? null,
+                        W: j.message.W ?? null,
+                    });
+                }
+            }
+        }
+
+        /* ------------------ 3) UI'de oturum listesi ------------------ */
+        container.innerHTML = "";
+        sessions.forEach((s, idx) => {
+            const btn = document.createElement("button");
+            const fmt = (date) => date.toLocaleString();
+            btn.textContent = `Oturum ${idx + 1}: ${fmt(s.start)} - ${
+                s.end ? fmt(s.end) : "..."
+            }`;
+            btn.className = "session-btn";
+            btn.onclick = () => renderCharts(idx);
+            container.appendChild(btn);
+        });
+
+        /* ------------------ 4) Grafik oluşturma ------------------ */
+        let charts = [];
+        function renderCharts(index) {
+            // Eski chartları temizle
+            charts.forEach((c) => c.destroy());
+            charts = [];
+            const wrap = document.getElementById("charts");
+            wrap.innerHTML = "";
+            const session = sessions[index];
+            if (!session) return;
+
+            // ZA değerlerini (saniye) ondalıklı olarak hesapla
+            const t0 = session.data[0]?.t ?? new Date();
+            const zaValues = session.data.map((d) => (d.t - t0) / 1000); // NUMBER!
+            const labels = zaValues.map((v) => v.toFixed(2)); // 2 ondalık
+
+            const makeCanvas = () => {
+                const c = document.createElement("canvas");
+                wrap.appendChild(c);
+                return c;
+            };
+
+            // Ortak seçenekler
+            const commonOpts = {
+                parsing: false,
+                scales: {
+                    x: {
+                        type: "linear",
+                        title: {
+                            display: true,
+                            text: "ZA (s)",
+                        },
+                    },
+                },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: {
+                        callbacks: {
+                            title: (items) => `ZA: ${items[0].label} s`,
+                        },
+                    },
+                },
+            };
+
+            // V (Volt)
+            charts.push(
+                new Chart(makeCanvas(), {
+                    type: "line",
+                    data: {
+                        labels,
+                        datasets: [
+                            {
+                                label: "V (Volt)",
+                                data: zaValues.map((v, i) => ({ x: v, y: session.data[i].V })),
+                            },
+                        ],
+                    },
+                    options: {
+                        ...commonOpts,
+                        plugins: {
+                            ...commonOpts.plugins,
+                            title: {
+                                display: true,
+                                text: "Voltaj (V)",
+                            },
+                        },
+                        scales: {
+                            ...commonOpts.scales,
+                            y: { title: { display: true, text: "V" } },
+                        },
+                    },
+                })
+            );
+
+            // A (Amper)
+            charts.push(
+                new Chart(makeCanvas(), {
+                    type: "line",
+                    data: {
+                        labels,
+                        datasets: [
+                            {
+                                label: "A (Amper)",
+                                data: zaValues.map((v, i) => ({ x: v, y: session.data[i].A })),
+                            },
+                        ],
+                    },
+                    options: {
+                        ...commonOpts,
+                        plugins: {
+                            ...commonOpts.plugins,
+                            title: { display: true, text: "Akım (A)" },
+                        },
+                        scales: {
+                            ...commonOpts.scales,
+                            y: { title: { display: true, text: "A" } },
+                        },
+                    },
+                })
+            );
+
+            // W (Watt)
+            charts.push(
+                new Chart(makeCanvas(), {
+                    type: "line",
+                    data: {
+                        labels,
+                        datasets: [
+                            {
+                                label: "W (Watt)",
+                                data: zaValues.map((v, i) => ({ x: v, y: session.data[i].W })),
+                            },
+                        ],
+                    },
+                    options: {
+                        ...commonOpts,
+                        plugins: {
+                            ...commonOpts.plugins,
+                            title: { display: true, text: "Güç (W)" },
+                        },
+                        scales: {
+                            ...commonOpts.scales,
+                            y: { title: { display: true, text: "W" } },
+                        },
+                    },
+                })
+            );
+        }
+    })();
+    </script>
+</body>
+</html>

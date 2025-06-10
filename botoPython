@@ -1,0 +1,80 @@
+import json
+import boto3
+from botocore.exceptions import ClientError
+from datetime import datetime
+
+# S3 client'ı başlat
+s3 = boto3.client('s3')
+
+def lambda_handler(event, context):
+    print("Incoming event:", event)
+
+    connectionId = event["requestContext"]["connectionId"]
+
+    # Gelen mesajı JSON formatına çevir
+    raw_message = event["body"]
+    print("Raw message received:", raw_message)
+    
+    # Gelen JSON verisini işleyin
+    message_dict = json.loads(raw_message)
+    
+    # Mesajın ID bilgisini al
+    device_id = message_dict.get("ID", "unknown_device")
+
+    # ID içinde boşluk karakteri varsa, yol problemi yaşanmaması için değiştirilebilir
+    device_id = device_id.replace(" ", "-")
+
+    # Zaman bilgisini ekleyin (gün, saat, dakika, saniye)
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    # Zaman bilgisini mesajın başına ekleyin
+    message_with_timestamp = {
+        "timestamp": current_time,
+        "message": message_dict
+    }
+
+    # Mesaj içeriğini satır bazlı eklemek için hazırlanır
+    formatted_message = json.dumps(message_with_timestamp) + "\n"
+
+    # S3 Bucket
+    bucket_name = 'pillerbucket'
+    
+    # ID’ye göre dinamik dosya yolu (html/ID/deneme.txt)
+    file_path = f'html/{device_id}/deneme.txt'
+
+    try:
+        # S3'te dosyayı almak (varsa)
+        try:
+            response = s3.get_object(Bucket=bucket_name, Key=file_path)
+            current_content = response['Body'].read().decode('utf-8')  # Mevcut içerik
+        except ClientError as e:
+            # Dosya yoksa yeni dosya oluşturulacak
+            if e.response['Error']['Code'] == 'NoSuchKey':
+                current_content = ""
+            else:
+                raise e
+        
+        # Yeni içeriği mevcut içeriğe ekle
+        updated_content = current_content + formatted_message
+
+        # Güncellenmiş içeriği tekrar S3'e yükle
+        s3.put_object(
+            Bucket=bucket_name,
+            Key=file_path,
+            Body=updated_content,
+            ContentType='text/plain',
+            ACL='public-read'
+        )
+        
+        # Başarılı sonuç döndürme
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Mesaj başarıyla eklendi!')
+        }
+    
+    except Exception as e:
+        # Hata durumunda geri döndürme
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f'Hata oluştu: {str(e)}')
+        }
